@@ -3,3 +3,4 @@ google-generativeai
 groq
 psycopg2-binary
 pydub
+tavily-python
