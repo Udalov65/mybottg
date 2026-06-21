@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import psycopg2
+import edge_tts
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (Application, MessageHandler, CommandHandler,
@@ -27,6 +28,7 @@ SYSTEM_PROMPT = """Ты ИИ-ассистент с чувством юмора. 
 
 MAX_TURNS = 20
 SUMMARY_TRIGGER = 30
+VOICE_NAME = "ru-RU-DmitryNeural"  # мужской; женский: ru-RU-SvetlanaNeural
 
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel("gemini-3.1-flash-lite", system_instruction=SYSTEM_PROMPT)
@@ -129,17 +131,11 @@ def ask_groq(history, summary, text):
     return resp.choices[0].message.content
 
 
-# --- Озвучка через Groq TTS ---
-def make_voice(text, path):
-    # Groq поддерживает синтез речи; обрезаем слишком длинное
-    snippet = text[:800]
-    resp = groq_client.audio.speech.create(
-        model="playai-tts",
-        voice="Arista-PlayAI",
-        input=snippet,
-        response_format="wav",
-    )
-    resp.write_to_file(path)
+# --- Озвучка через Edge TTS (бесплатно, русский голос) ---
+async def make_voice(text, path):
+    snippet = text[:1000]
+    communicate = edge_tts.Communicate(snippet, voice=VOICE_NAME)
+    await communicate.save(path)
 
 
 # --- Распознавание голоса ---
@@ -214,8 +210,8 @@ async def send_answer(update, context, uid, answer):
     await update.message.reply_text(answer)
     if get_voice_mode(uid):
         try:
-            path = f"/tmp/tts_{uid}.wav"
-            make_voice(answer, path)
+            path = f"/tmp/tts_{uid}.mp3"
+            await make_voice(answer, path)
             with open(path, "rb") as f:
                 await update.message.reply_voice(f)
             os.remove(path)
