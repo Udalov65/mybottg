@@ -2,3 +2,4 @@ python-telegram-bot
 google-generativeai
 groq
 psycopg2-binary
+pydub
