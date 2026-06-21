@@ -1,8 +1,11 @@
 import os
+import re
 import json
 import asyncio
 import psycopg2
 import edge_tts
+from io import BytesIO
+from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (Application, MessageHandler, CommandHandler,
@@ -131,9 +134,17 @@ def ask_groq(history, summary, text):
     return resp.choices[0].message.content
 
 
-# --- Озвучка через Edge TTS (бесплатно, русский голос) ---
+# --- Чистим текст для озвучки (убираем эмодзи и разметку) ---
+def clean_for_voice(text):
+    text = re.sub(r"[^\w\s.,!?;:()«»\"'-]", " ", text)
+    text = text.replace("*", " ").replace("#", " ").replace("_", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# --- Озвучка через Edge TTS ---
 async def make_voice(text, path):
-    snippet = text[:1000]
+    snippet = clean_for_voice(text)[:1000]
     communicate = edge_tts.Communicate(snippet, voice=VOICE_NAME)
     await communicate.save(path)
 
@@ -172,6 +183,24 @@ async def transcribe_video_note(update, context):
                 os.remove(p)
 
 
+# --- Распознавание изображений (со сжатием для экономии) ---
+async def describe_image(update, context, caption):
+    photo = update.message.photo[-1]
+    tg_file = await context.bot.get_file(photo.file_id)
+    raw = await tg_file.download_as_bytearray()
+    img = Image.open(BytesIO(bytes(raw)))
+    img.thumbnail((1024, 1024))
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=85)
+    img_bytes = buf.getvalue()
+    question = caption or "Что на этом изображении? Опиши в своём стиле."
+    r = model.generate_content([
+        question,
+        {"mime_type": "image/jpeg", "data": img_bytes},
+    ])
+    return r.text
+
+
 # --- Получить ответ модели (Gemini → Groq) ---
 async def get_answer(update, user, history, summary, user_text):
     sys = SYSTEM_PROMPT + (f"\n\nЧто ты помнишь о собеседнике: {summary}" if summary else "")
@@ -205,18 +234,26 @@ async def get_answer(update, user, history, summary, user_text):
         return None, history
 
 
-# --- Отправка ответа (текст + опц. голос) ---
+# --- Отправка ответа: текст и голос подряд, без паузы ---
 async def send_answer(update, context, uid, answer):
-    await update.message.reply_text(answer)
     if get_voice_mode(uid):
+        path = f"/tmp/tts_{uid}.mp3"
+        voice_ready = False
         try:
-            path = f"/tmp/tts_{uid}.mp3"
             await make_voice(answer, path)
-            with open(path, "rb") as f:
-                await update.message.reply_voice(f)
-            os.remove(path)
+            voice_ready = True
         except Exception as e:
             print(f"Озвучка не удалась: {e}")
+        await update.message.reply_text(answer)
+        if voice_ready:
+            try:
+                with open(path, "rb") as f:
+                    await update.message.reply_voice(f)
+                os.remove(path)
+            except Exception as e:
+                print(f"Отправка голоса не удалась: {e}")
+    else:
+        await update.message.reply_text(answer)
 
 
 # --- Основной обработчик ---
@@ -243,6 +280,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не смог разобрать кружок 😕")
             print(f"Ошибка распознавания кружка: {e}")
             return
+    elif update.message.photo:
+        if ALLOWED and user.id not in ALLOWED:
+            await update.message.reply_text(f"Доступ только для семьи. Твой ID: {user.id}")
+            return
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        print(f"[{user.first_name} 🖼→]: (фото)")
+        try:
+            answer = await describe_image(update, context, update.message.caption)
+        except Exception as e:
+            await update.message.reply_text("Не смог разобрать картинку 😕")
+            print(f"Ошибка распознавания фото: {e}")
+            return
+        await send_answer(update, context, uid, answer)
+        return
     else:
         user_text = update.message.text
         print(f"[{user.first_name} →]: {user_text}")
@@ -273,7 +324,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я ваш семейный ИИ-помощник 🤖\nПиши текстом, голосом или кружком — отвечу на всё.\n"
+        "Привет! Я ваш семейный ИИ-помощник 🤖\nПиши текстом, голосом, кружком или шли фото — отвечу на всё.\n"
         "Команды смотри в /help.")
 
 
@@ -284,7 +335,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(
         "Что я умею:\n\n"
-        "💬 Отвечаю на текст, 🎤 голосовые и ⭕ кружки\n"
+        "💬 Отвечаю на текст, 🎤 голосовые, ⭕ кружки и 🖼 фото\n"
         "🧠 Помню наш разговор\n"
         "🔊 /voice — отвечать ещё и голосом\n"
         "🔎 /search запрос — поиск свежего в интернете\n"
@@ -352,7 +403,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Готово. Отправлено: {sent}, не дошло: {failed}")
 
 
-# --- Обработка нажатий кнопок ---
+# --- Кнопки ---
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = str(q.from_user.id)
@@ -377,6 +428,7 @@ app.add_handler(CommandHandler("myid", myid))
 app.add_handler(CommandHandler("reset", reset))
 app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CallbackQueryHandler(on_button))
-app.add_handler(MessageHandler((filters.TEXT | filters.VOICE | filters.VIDEO_NOTE) & ~filters.COMMAND, handle))
+app.add_handler(MessageHandler(
+    (filters.TEXT | filters.VOICE | filters.VIDEO_NOTE | filters.PHOTO) & ~filters.COMMAND, handle))
 print("Бот запущен...")
 app.run_polling()
