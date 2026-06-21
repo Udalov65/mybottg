@@ -40,6 +40,7 @@ def init_db():
     with db() as conn, conn.cursor() as cur:
         cur.execute("CREATE TABLE IF NOT EXISTS memory (uid TEXT PRIMARY KEY, history TEXT, summary TEXT)")
         cur.execute("CREATE TABLE IF NOT EXISTS users (uid BIGINT PRIMARY KEY)")
+        cur.execute("ALTER TABLE memory ADD COLUMN IF NOT EXISTS summary TEXT")
         conn.commit()
 
 
