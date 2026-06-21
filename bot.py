@@ -23,7 +23,7 @@ SYSTEM_PROMPT = """Ты ИИ-ассистент с чувством юмора. 
 все свои, но делай это не огромными текстами, а коротко. И при этом реально помогай: за шутками не забывай нормально отвечать на вопрос.
 Подстраивайся под собеседника и запоминай детали разговора."""
 
-MAX_TURNS = 20          # сколько последних сообщений держать в активной истории
+MAX_TURNS = 20          # сколько последних сообщений держать дословно
 SUMMARY_TRIGGER = 30    # при скольких сообщениях сжимать старое в выжимку
 
 genai.configure(api_key=GEMINI_KEY)
@@ -94,7 +94,6 @@ def make_summary(old_summary, messages):
         r = model.generate_content(prompt)
         return r.text.strip()
     except Exception:
-        # если Gemini занят — пробуем Groq
         try:
             resp = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -140,13 +139,34 @@ async def transcribe_voice(update, context):
             os.remove(ogg_path)
 
 
+# --- Распознавание кружков (видеосообщений) ---
+async def transcribe_video_note(update, context):
+    note = update.message.video_note
+    tg_file = await context.bot.get_file(note.file_id)
+    mp4_path = f"/tmp/{note.file_id}.mp4"
+    mp3_path = f"/tmp/{note.file_id}.mp3"
+    await tg_file.download_to_drive(mp4_path)
+    try:
+        os.system(f"ffmpeg -i {mp4_path} -vn -acodec libmp3lame {mp3_path} -y -loglevel quiet")
+        with open(mp3_path, "rb") as f:
+            tr = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo",
+                file=(mp3_path, f.read()),
+            )
+        return tr.text
+    finally:
+        for p in (mp4_path, mp3_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+
 # --- Основной обработчик ---
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
     add_user(user.id)
 
-    # Текст или голос?
+    # Текст, голос или кружок?
     if update.message.voice:
         try:
             user_text = await transcribe_voice(update, context)
@@ -155,6 +175,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text("Не смог разобрать голосовое 😕 попробуй ещё раз или текстом.")
             print(f"Ошибка распознавания: {e}")
+            return
+    elif update.message.video_note:
+        try:
+            user_text = await transcribe_video_note(update, context)
+            print(f"[{user.first_name} ⭕→]: {user_text}")
+            await update.message.reply_text(f"⭕ Расшифровал: «{user_text}»")
+        except Exception as e:
+            await update.message.reply_text("Не смог разобрать кружок 😕 попробуй ещё раз или текстом.")
+            print(f"Ошибка распознавания кружка: {e}")
             return
     else:
         user_text = update.message.text
@@ -170,7 +199,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history, summary = get_memory(uid)
     history = history[-MAX_TURNS:]
 
-    # В системную инструкцию подмешиваем выжимку памяти
     sys = SYSTEM_PROMPT
     if summary:
         sys += f"\n\nЧто ты помнишь о собеседнике: {summary}"
@@ -217,8 +245,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Если история разрослась — сжимаем старую часть в выжимку
     if len(new_history) >= SUMMARY_TRIGGER:
-        old_part = new_history[:-MAX_TURNS]      # самое старое
-        keep = new_history[-MAX_TURNS:]          # оставляем свежее
+        old_part = new_history[:-MAX_TURNS]
+        keep = new_history[-MAX_TURNS:]
         summary = make_summary(summary, old_part)
         new_history = keep
         print(f"[Память сжата для {user.first_name}]")
@@ -263,6 +291,6 @@ app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("myid", myid))
 app.add_handler(CommandHandler("reset", reset))
 app.add_handler(CommandHandler("broadcast", broadcast))
-app.add_handler(MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, handle))
+app.add_handler(MessageHandler((filters.TEXT | filters.VOICE | filters.VIDEO_NOTE) & ~filters.COMMAND, handle))
 print("Бот запущен...")
 app.run_polling()
