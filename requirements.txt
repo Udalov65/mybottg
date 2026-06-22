@@ -6,3 +6,4 @@ pydub
 tavily-python
 edge-tts
 Pillow
+flask
