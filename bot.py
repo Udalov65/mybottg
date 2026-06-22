@@ -2,10 +2,12 @@ import os
 import re
 import json
 import asyncio
+import threading
 import psycopg2
 import edge_tts
 from io import BytesIO
 from PIL import Image
+from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (Application, MessageHandler, CommandHandler,
@@ -23,6 +25,7 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 DATABASE_URL = os.environ["DATABASE_URL"]
 TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 ALLOWED = [int(x) for x in os.environ.get("ALLOWED", "").replace(" ", "").split(",") if x]
+PORT = int(os.environ.get("PORT", 5000))
 # =====================================================
 
 SYSTEM_PROMPT = """Ты ИИ-ассистент с чувством юмора. Общайся на ты, дерзко и смешно.Шути, подкалывай, отвечай с сарказмом, можешь крепко выражаться и материться,черный юмор,
@@ -31,12 +34,13 @@ SYSTEM_PROMPT = """Ты ИИ-ассистент с чувством юмора. 
 
 MAX_TURNS = 20
 SUMMARY_TRIGGER = 30
-VOICE_NAME = "ru-RU-DmitryNeural"  # мужской; женский: ru-RU-SvetlanaNeural
+VOICE_NAME = "ru-RU-DmitryNeural"
 
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel("gemini-3.1-flash-lite", system_instruction=SYSTEM_PROMPT)
 groq_client = Groq(api_key=GROQ_KEY)
 tavily = TavilyClient(api_key=TAVILY_KEY) if TAVILY_KEY else None
+flask_app = Flask(__name__)
 
 
 # --- База данных ---
@@ -134,7 +138,32 @@ def ask_groq(history, summary, text):
     return resp.choices[0].message.content
 
 
-# --- Чистим текст для озвучки (убираем эмодзи и разметку) ---
+# --- Получить ответ модели (Gemini → Groq) ---
+def get_answer_sync(history, summary, user_text):
+    sys = SYSTEM_PROMPT + (f"\n\nЧто ты помнишь о собеседнике: {summary}" if summary else "")
+    local_model = genai.GenerativeModel("gemini-3.1-flash-lite", system_instruction=sys)
+    chat = local_model.start_chat(history=history)
+    for attempt in range(2):
+        try:
+            r = chat.send_message(user_text)
+            new_history = [{"role": m.role, "parts": [p.text for p in m.parts]} for m in chat.history]
+            return r.text, new_history
+        except Exception as e:
+            if "429" in str(e) and attempt < 1:
+                import time
+                time.sleep(15)
+                continue
+            break
+    try:
+        ans = ask_groq(history, summary, user_text)
+        new_history = history + [{"role": "user", "parts": [user_text]},
+                                 {"role": "model", "parts": [ans]}]
+        return ans, new_history
+    except Exception:
+        return None, history
+
+
+# --- Чистим текст для озвучки ---
 def clean_for_voice(text):
     text = re.sub(r"[^\w\s.,!?;:()«»\"'-]", " ", text)
     text = text.replace("*", " ").replace("#", " ").replace("_", " ")
@@ -183,7 +212,7 @@ async def transcribe_video_note(update, context):
                 os.remove(p)
 
 
-# --- Распознавание изображений (со сжатием для экономии) ---
+# --- Распознавание изображений ---
 async def describe_image(update, context, caption):
     photo = update.message.photo[-1]
     tg_file = await context.bot.get_file(photo.file_id)
@@ -194,14 +223,11 @@ async def describe_image(update, context, caption):
     img.convert("RGB").save(buf, format="JPEG", quality=85)
     img_bytes = buf.getvalue()
     question = caption or "Что на этом изображении? Опиши в своём стиле."
-    r = model.generate_content([
-        question,
-        {"mime_type": "image/jpeg", "data": img_bytes},
-    ])
+    r = model.generate_content([question, {"mime_type": "image/jpeg", "data": img_bytes}])
     return r.text
 
 
-# --- Получить ответ модели (Gemini → Groq) ---
+# --- Получить ответ (async версия для Telegram) ---
 async def get_answer(update, user, history, summary, user_text):
     sys = SYSTEM_PROMPT + (f"\n\nЧто ты помнишь о собеседнике: {summary}" if summary else "")
     local_model = genai.GenerativeModel("gemini-3.1-flash-lite", system_instruction=sys)
@@ -234,7 +260,7 @@ async def get_answer(update, user, history, summary, user_text):
         return None, history
 
 
-# --- Отправка ответа: текст и голос подряд, без паузы ---
+# --- Отправка ответа (текст + голос) ---
 async def send_answer(update, context, uid, answer):
     if get_voice_mode(uid):
         path = f"/tmp/tts_{uid}.mp3"
@@ -256,7 +282,78 @@ async def send_answer(update, context, uid, answer):
         await update.message.reply_text(answer)
 
 
-# --- Основной обработчик ---
+# =============================================
+# --- МАРУСЯ: обработчик webhook ---
+# =============================================
+@flask_app.route("/marusia", methods=["POST"])
+def marusia_webhook():
+    data = request.json
+    if not data:
+        return jsonify({"version": "1.0", "response": {"text": "Ошибка запроса", "end_session": True}})
+
+    # ID сессии как uid для памяти
+    session = data.get("session", {})
+    uid = "marusia_" + session.get("application", {}).get("application_id", "unknown")
+    command = data.get("request", {}).get("command", "").strip()
+    is_new = session.get("new", False)
+
+    # Приветствие при первом запуске
+    if is_new or not command:
+        return jsonify({
+            "version": "1.0",
+            "response": {
+                "text": "Привет! Я твой семейный ассистент. Спрашивай — отвечу.",
+                "end_session": False
+            }
+        })
+
+    # Завершение сессии
+    if command.lower() in ["стоп", "выход", "выйди", "хватит", "пока"]:
+        return jsonify({
+            "version": "1.0",
+            "response": {
+                "text": "Пока! Обращайся если что.",
+                "end_session": True
+            }
+        })
+
+    # Получаем память и генерируем ответ
+    history, summary = get_memory(uid)
+    history = history[-MAX_TURNS:]
+    answer, new_history = get_answer_sync(history, summary, command)
+
+    if answer is None:
+        return jsonify({
+            "version": "1.0",
+            "response": {
+                "text": "Сервис временно недоступен, попробуй позже.",
+                "end_session": False
+            }
+        })
+
+    # Сохраняем память
+    if len(new_history) >= SUMMARY_TRIGGER:
+        summary = make_summary(summary, new_history[:-MAX_TURNS])
+        new_history = new_history[-MAX_TURNS:]
+    save_memory(uid, new_history[-MAX_TURNS:], summary)
+
+    print(f"[Маруся → ]: {command}")
+    print(f"[→ Маруся]: {answer}")
+
+    # Чистим текст для голоса (Маруся сама озвучивает)
+    clean = clean_for_voice(answer)
+
+    return jsonify({
+        "version": "1.0",
+        "response": {
+            "text": clean,
+            "tts": clean,           # то, что Маруся озвучит
+            "end_session": False    # сессия продолжается
+        }
+    })
+
+
+# --- Telegram: основной обработчик ---
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
@@ -304,7 +401,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-
     history, summary = get_memory(uid)
     history = history[-MAX_TURNS:]
     answer, new_history = await get_answer(update, user, history, summary, user_text)
@@ -321,7 +417,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_memory(uid, new_history[-MAX_TURNS:], summary)
 
 
-# --- Команды ---
+# --- Telegram: команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я ваш семейный ИИ-помощник 🤖\nПиши текстом, голосом, кружком или шли фото — отвечу на всё.\n"
@@ -403,7 +499,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Готово. Отправлено: {sent}, не дошло: {failed}")
 
 
-# --- Кнопки ---
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = str(q.from_user.id)
@@ -417,8 +512,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🔊 Озвучка включена!" if new else "🔇 Озвучка выключена.")
 
 
+# --- Запуск Flask в отдельном потоке ---
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+
 # --- Запуск ---
 init_db()
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+print(f"Flask запущен на порту {PORT}")
+
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("help", help_cmd))
