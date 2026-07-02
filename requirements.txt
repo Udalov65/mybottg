@@ -5,5 +5,3 @@ psycopg2-binary
 pydub
 tavily-python
 edge-tts
-Pillow
-flask
