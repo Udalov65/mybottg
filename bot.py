@@ -2,12 +2,10 @@ import os
 import re
 import json
 import asyncio
-import threading
 import psycopg2
 import edge_tts
 from io import BytesIO
 from PIL import Image
-from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (Application, MessageHandler, CommandHandler,
@@ -25,7 +23,6 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 DATABASE_URL = os.environ["DATABASE_URL"]
 TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 ALLOWED = [int(x) for x in os.environ.get("ALLOWED", "").replace(" ", "").split(",") if x]
-PORT = int(os.environ.get("PORT", 5000))
 # =====================================================
 
 SYSTEM_PROMPT = """Ты ИИ-ассистент с чувством юмора. Общайся на ты, дерзко и смешно.Шути, подкалывай, отвечай с сарказмом, можешь крепко выражаться и материться,черный юмор,
@@ -34,13 +31,12 @@ SYSTEM_PROMPT = """Ты ИИ-ассистент с чувством юмора. 
 
 MAX_TURNS = 20
 SUMMARY_TRIGGER = 30
-VOICE_NAME = "ru-RU-DmitryNeural"
+VOICE_NAME = "ru-RU-DmitryNeural"  # мужской; женский: ru-RU-SvetlanaNeural
 
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel("gemini-3.1-flash-lite", system_instruction=SYSTEM_PROMPT)
 groq_client = Groq(api_key=GROQ_KEY)
 tavily = TavilyClient(api_key=TAVILY_KEY) if TAVILY_KEY else None
-flask_app = Flask(__name__)
 
 
 # --- База данных ---
@@ -138,42 +134,9 @@ def ask_groq(history, summary, text):
     return resp.choices[0].message.content
 
 
-# --- Получить ответ модели (Gemini → Groq) ---
-def get_answer_sync(history, summary, user_text):
-    sys = SYSTEM_PROMPT + (f"\n\nЧто ты помнишь о собеседнике: {summary}" if summary else "")
-    local_model = genai.GenerativeModel("gemini-3.1-flash-lite", system_instruction=sys)
-    chat = local_model.start_chat(history=history)
-    for attempt in range(2):
-        try:
-            r = chat.send_message(user_text)
-            new_history = [{"role": m.role, "parts": [p.text for p in m.parts]} for m in chat.history]
-            return r.text, new_history
-        except Exception as e:
-            if "429" in str(e) and attempt < 1:
-                import time
-                time.sleep(15)
-                continue
-            break
-    try:
-        ans = ask_groq(history, summary, user_text)
-        new_history = history + [{"role": "user", "parts": [user_text]},
-                                 {"role": "model", "parts": [ans]}]
-        return ans, new_history
-    except Exception:
-        return None, history
-
-
-# --- Чистим текст для озвучки ---
-def clean_for_voice(text):
-    text = re.sub(r"[^\w\s.,!?;:()«»\"'-]", " ", text)
-    text = text.replace("*", " ").replace("#", " ").replace("_", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-# --- Озвучка через Edge TTS ---
+# --- Озвучка через Edge TTS (бесплатно, русский голос) ---
 async def make_voice(text, path):
-    snippet = clean_for_voice(text)[:1000]
+    snippet = text[:1000]
     communicate = edge_tts.Communicate(snippet, voice=VOICE_NAME)
     await communicate.save(path)
 
@@ -212,22 +175,7 @@ async def transcribe_video_note(update, context):
                 os.remove(p)
 
 
-# --- Распознавание изображений ---
-async def describe_image(update, context, caption):
-    photo = update.message.photo[-1]
-    tg_file = await context.bot.get_file(photo.file_id)
-    raw = await tg_file.download_as_bytearray()
-    img = Image.open(BytesIO(bytes(raw)))
-    img.thumbnail((1024, 1024))
-    buf = BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=85)
-    img_bytes = buf.getvalue()
-    question = caption or "Что на этом изображении? Опиши в своём стиле."
-    r = model.generate_content([question, {"mime_type": "image/jpeg", "data": img_bytes}])
-    return r.text
-
-
-# --- Получить ответ (async версия для Telegram) ---
+# --- Получить ответ модели (Gemini → Groq) ---
 async def get_answer(update, user, history, summary, user_text):
     sys = SYSTEM_PROMPT + (f"\n\nЧто ты помнишь о собеседнике: {summary}" if summary else "")
     local_model = genai.GenerativeModel("gemini-3.1-flash-lite", system_instruction=sys)
@@ -260,100 +208,21 @@ async def get_answer(update, user, history, summary, user_text):
         return None, history
 
 
-# --- Отправка ответа (текст + голос) ---
+# --- Отправка ответа (текст + опц. голос) ---
 async def send_answer(update, context, uid, answer):
+    await update.message.reply_text(answer)
     if get_voice_mode(uid):
-        path = f"/tmp/tts_{uid}.mp3"
-        voice_ready = False
         try:
+            path = f"/tmp/tts_{uid}.mp3"
             await make_voice(answer, path)
-            voice_ready = True
+            with open(path, "rb") as f:
+                await update.message.reply_voice(f)
+            os.remove(path)
         except Exception as e:
             print(f"Озвучка не удалась: {e}")
-        await update.message.reply_text(answer)
-        if voice_ready:
-            try:
-                with open(path, "rb") as f:
-                    await update.message.reply_voice(f)
-                os.remove(path)
-            except Exception as e:
-                print(f"Отправка голоса не удалась: {e}")
-    else:
-        await update.message.reply_text(answer)
 
 
-# =============================================
-# --- МАРУСЯ: обработчик webhook ---
-# =============================================
-@flask_app.route("/marusia", methods=["POST"])
-def marusia_webhook():
-    data = request.json
-    if not data:
-        return jsonify({"version": "1.0", "response": {"text": "Ошибка запроса", "end_session": True}})
-
-    # ID сессии как uid для памяти
-    session = data.get("session", {})
-    uid = "marusia_" + session.get("application", {}).get("application_id", "unknown")
-    command = data.get("request", {}).get("command", "").strip()
-    is_new = session.get("new", False)
-
-    # Приветствие при первом запуске
-    if is_new or not command:
-        return jsonify({
-            "version": "1.0",
-            "response": {
-                "text": "Привет! Я твой семейный ассистент. Спрашивай — отвечу.",
-                "end_session": False
-            }
-        })
-
-    # Завершение сессии
-    if command.lower() in ["стоп", "выход", "выйди", "хватит", "пока"]:
-        return jsonify({
-            "version": "1.0",
-            "response": {
-                "text": "Пока! Обращайся если что.",
-                "end_session": True
-            }
-        })
-
-    # Получаем память и генерируем ответ
-    history, summary = get_memory(uid)
-    history = history[-MAX_TURNS:]
-    answer, new_history = get_answer_sync(history, summary, command)
-
-    if answer is None:
-        return jsonify({
-            "version": "1.0",
-            "response": {
-                "text": "Сервис временно недоступен, попробуй позже.",
-                "end_session": False
-            }
-        })
-
-    # Сохраняем память
-    if len(new_history) >= SUMMARY_TRIGGER:
-        summary = make_summary(summary, new_history[:-MAX_TURNS])
-        new_history = new_history[-MAX_TURNS:]
-    save_memory(uid, new_history[-MAX_TURNS:], summary)
-
-    print(f"[Маруся → ]: {command}")
-    print(f"[→ Маруся]: {answer}")
-
-    # Чистим текст для голоса (Маруся сама озвучивает)
-    clean = clean_for_voice(answer)
-
-    return jsonify({
-        "version": "1.0",
-        "response": {
-            "text": clean,
-            "tts": clean,           # то, что Маруся озвучит
-            "end_session": False    # сессия продолжается
-        }
-    })
-
-
-# --- Telegram: основной обработчик ---
+# --- Основной обработчик ---
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
@@ -377,20 +246,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не смог разобрать кружок 😕")
             print(f"Ошибка распознавания кружка: {e}")
             return
-    elif update.message.photo:
-        if ALLOWED and user.id not in ALLOWED:
-            await update.message.reply_text(f"Доступ только для семьи. Твой ID: {user.id}")
-            return
-        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-        print(f"[{user.first_name} 🖼→]: (фото)")
-        try:
-            answer = await describe_image(update, context, update.message.caption)
-        except Exception as e:
-            await update.message.reply_text("Не смог разобрать картинку 😕")
-            print(f"Ошибка распознавания фото: {e}")
-            return
-        await send_answer(update, context, uid, answer)
-        return
     else:
         user_text = update.message.text
         print(f"[{user.first_name} →]: {user_text}")
@@ -401,6 +256,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+
     history, summary = get_memory(uid)
     history = history[-MAX_TURNS:]
     answer, new_history = await get_answer(update, user, history, summary, user_text)
@@ -417,10 +273,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_memory(uid, new_history[-MAX_TURNS:], summary)
 
 
-# --- Telegram: команды ---
+# --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я ваш семейный ИИ-помощник 🤖\nПиши текстом, голосом, кружком или шли фото — отвечу на всё.\n"
+        "Привет! Я ваш семейный ИИ-помощник 🤖\nПиши текстом, голосом или кружком — отвечу на всё.\n"
         "Команды смотри в /help.")
 
 
@@ -431,7 +287,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(
         "Что я умею:\n\n"
-        "💬 Отвечаю на текст, 🎤 голосовые, ⭕ кружки и 🖼 фото\n"
+        "💬 Отвечаю на текст, 🎤 голосовые и ⭕ кружки\n"
         "🧠 Помню наш разговор\n"
         "🔊 /voice — отвечать ещё и голосом\n"
         "🔎 /search запрос — поиск свежего в интернете\n"
@@ -499,6 +355,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Готово. Отправлено: {sent}, не дошло: {failed}")
 
 
+# --- Обработка нажатий кнопок ---
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = str(q.from_user.id)
@@ -512,17 +369,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🔊 Озвучка включена!" if new else "🔇 Озвучка выключена.")
 
 
-# --- Запуск Flask в отдельном потоке ---
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-
-
 # --- Запуск ---
 init_db()
-flask_thread = threading.Thread(target=run_flask, daemon=True)
-flask_thread.start()
-print(f"Flask запущен на порту {PORT}")
-
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("help", help_cmd))
@@ -532,7 +380,6 @@ app.add_handler(CommandHandler("myid", myid))
 app.add_handler(CommandHandler("reset", reset))
 app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CallbackQueryHandler(on_button))
-app.add_handler(MessageHandler(
-    (filters.TEXT | filters.VOICE | filters.VIDEO_NOTE | filters.PHOTO) & ~filters.COMMAND, handle))
+app.add_handler(MessageHandler((filters.TEXT | filters.VOICE | filters.VIDEO_NOTE) & ~filters.COMMAND, handle))
 print("Бот запущен...")
 app.run_polling()
